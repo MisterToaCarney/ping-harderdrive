@@ -11,7 +11,7 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-const CHUNK_SIZE = 1400
+const CHUNK_SIZE = 1450
 const NUM_REPEATS = 3
 
 type Reply struct {
@@ -19,31 +19,6 @@ type Reply struct {
 	Seq     int
 	ID      int
 	Payload []byte
-}
-
-var peers = []string{
-	"109.164.248.166",
-	"2.23.121.61",
-	"106.226.158.50",
-	"113.246.36.49",
-	"41.24.25.190",
-	"82.36.144.170",
-	"47.108.38.98",
-	"90.201.105.248",
-	"23.195.163.80",
-	"84.61.74.86",
-	"154.127.130.243",
-	"82.197.232.106",
-	"90.218.116.236",
-	"117.78.35.76",
-	"130.254.47.72",
-	"168.245.3.26",
-	"112.31.104.166",
-	"38.173.248.60",
-	"3.211.13.156",
-	"58.219.127.156",
-	"113.246.70.207",
-	"23.53.32.110",
 }
 
 type StatusUpdate struct {
@@ -93,7 +68,7 @@ func GetReplies(conn *icmp.PacketConn, c chan Reply) {
 		n, peer, err := conn.ReadFrom(reply)
 		if err != nil {
 			fmt.Println(err)
-			continue
+			return
 		}
 
 		recievedMessage, err := icmp.ParseMessage(1, reply[:n])
@@ -124,7 +99,7 @@ func ReadFile(filename string) []byte {
 	return dat
 }
 
-func InitialTransmit(conn *icmp.PacketConn, data []byte) {
+func InitialTransmit(conn *icmp.PacketConn, data []byte, peers []string) {
 	seq := 0
 	peerCounter := 0
 
@@ -170,7 +145,7 @@ func Monitor(statusUpdates chan StatusUpdate, state chan map[int][]bool) {
 			listing := stats[i]
 			out[listing.Seq] = make([]bool, len(listing.Dups))
 			for i, dupTime := range listing.Dups {
-				out[listing.Seq][i] = time.Since(dupTime) > 500*time.Millisecond
+				out[listing.Seq][i] = time.Since(dupTime) > 400*time.Millisecond
 			}
 		}
 
@@ -195,11 +170,13 @@ func Monitor(statusUpdates chan StatusUpdate, state chan map[int][]bool) {
 }
 
 func main() {
-	conn, err := icmp.ListenPacket("ip4:icmp", "192.168.1.181")
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
 		panic(err)
 	}
 	defer conn.Close()
+
+	peers := FindPeers(200)
 
 	incomingReplies := make(chan Reply)
 	statusUpdates := make(chan StatusUpdate, 4096)
@@ -208,7 +185,7 @@ func main() {
 	go GetReplies(conn, incomingReplies)
 	go Monitor(statusUpdates, health)
 
-	InitialTransmit(conn, ReadFile("test.bin"))
+	InitialTransmit(conn, ReadFile("test.bin"), peers)
 
 	peerCounter := 0
 
