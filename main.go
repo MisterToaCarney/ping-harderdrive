@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"os"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -16,6 +15,13 @@ const NUM_REPEATS = 3
 
 type Reply struct {
 	From    net.Addr
+	Seq     int
+	ID      int
+	Payload []byte
+}
+
+type Request struct {
+	To      string
 	Seq     int
 	ID      int
 	Payload []byte
@@ -33,13 +39,7 @@ type StatusListing struct {
 	Dups []time.Time
 }
 
-func Ping(conn *icmp.PacketConn, rawAddress string, data []byte, seq int, id int) {
-	addr, err := net.ResolveIPAddr("ip4", rawAddress)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
+func Ping(conn *icmp.PacketConn, address net.Addr, data []byte, seq int, id int) {
 	message := icmp.Message{Type: ipv4.ICMPTypeEcho, Code: 0, Body: &icmp.Echo{ID: id, Seq: seq, Data: data}}
 	b, err := message.Marshal(nil)
 	if err != nil {
@@ -47,7 +47,7 @@ func Ping(conn *icmp.PacketConn, rawAddress string, data []byte, seq int, id int
 		return
 	}
 
-	conn.WriteTo(b, addr)
+	conn.WriteTo(b, address)
 }
 
 func DecodeEchoPacket(data []byte) (uint16, uint16, []byte) {
@@ -91,36 +91,71 @@ func GetReplies(conn *icmp.PacketConn, c chan Reply) {
 	}
 }
 
-func ReadFile(filename string) []byte {
-	dat, err := os.ReadFile(filename)
-	if err != nil {
-		panic(err)
+func SendRequests(conn *icmp.PacketConn, c chan Request) {
+	for request := range c {
+		addr, err := net.ResolveIPAddr("ip4", request.To)
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		Ping(conn, addr, request.Payload, request.Seq, request.ID)
 	}
-	return dat
 }
 
-func InitialTransmit(conn *icmp.PacketConn, data []byte, peers []string) {
-	seq := 0
+// func ReadFile(filename string) []byte {
+// 	dat, err := os.ReadFile(filename)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	return dat
+// }
+
+func CheckIntroduced(health map[int][]bool, targetLength int) bool {
+	if len(health) >= targetLength {
+		target := health[len(health)-1]
+		introduced := true
+		for _, status := range target {
+			if status {
+				introduced = false
+			}
+		}
+		return introduced
+	}
+	return false
+}
+
+func IntroduceChunk(seq int, outgoingRequests chan Request, healthChan chan map[int][]bool, peers []string) {
+	targetChunkCount := len(<-healthChan) + 1
 	peerCounter := 0
 
-	for start := 0; start < len(data); start += CHUNK_SIZE {
-		end := start + CHUNK_SIZE
-		if end > len(data) {
-			end = len(data)
-		}
+	for {
+		outgoingRequests <- Request{To: peers[peerCounter], Seq: seq, ID: 0, Payload: make([]byte, CHUNK_SIZE)}
+		peerCounter++
+		deadline := time.Now().Add(500 * time.Millisecond)
 
-		for i := 0; i < NUM_REPEATS; i++ {
-			peer := peers[peerCounter%len(peers)]
-			peerCounter++
-			Ping(conn, peer, data[start:end], seq, i)
-		}
+	checkLoop:
+		for {
+			select {
+			case health := <-healthChan:
+				if time.Since(deadline) > 0 {
+					break checkLoop
+				}
+				introduced := CheckIntroduced(health, targetChunkCount)
+				if introduced {
+					return
+				}
 
-		seq++
+			case <-time.After(100 * time.Millisecond):
+				break checkLoop
+			}
+		}
 	}
 }
 
-func WriteFile(filename string, data []byte) {
-	os.WriteFile(filename, data, 0644)
+func IntroduceChunks(count int, outgoingRequests chan Request, healthChan chan map[int][]bool, peers []string) {
+	for i := 0; i < count; i++ {
+		IntroduceChunk(i, outgoingRequests, healthChan, peers)
+	}
 }
 
 func Monitor(statusUpdates chan StatusUpdate, state chan map[int][]bool) {
@@ -145,11 +180,11 @@ func Monitor(statusUpdates chan StatusUpdate, state chan map[int][]bool) {
 			listing := stats[i]
 			out[listing.Seq] = make([]bool, len(listing.Dups))
 			for i, dupTime := range listing.Dups {
-				out[listing.Seq][i] = time.Since(dupTime) > 400*time.Millisecond
+				out[listing.Seq][i] = time.Since(dupTime) > 200*time.Millisecond
 			}
 		}
 
-		if time.Since(lastPrint) >= 500*time.Millisecond {
+		if time.Since(lastPrint) >= 300*time.Millisecond {
 			lastPrint = time.Now()
 			fmt.Println()
 			for i := 0; i < len(out); i++ {
@@ -178,36 +213,43 @@ func main() {
 
 	peers := FindPeers(200)
 
+	fmt.Println("Found peers")
+
 	incomingReplies := make(chan Reply)
+	outgoingRequests := make(chan Request)
 	statusUpdates := make(chan StatusUpdate, 4096)
 	health := make(chan map[int][]bool)
+	introduceHealth := make(chan map[int][]bool)
 
 	go GetReplies(conn, incomingReplies)
+	go SendRequests(conn, outgoingRequests)
 	go Monitor(statusUpdates, health)
-
-	InitialTransmit(conn, ReadFile("test.bin"), peers)
 
 	peerCounter := 0
 
+	go IntroduceChunks(70, outgoingRequests, introduceHealth, peers)
+
 	for reply := range incomingReplies {
-		outPeer := peers[peerCounter%len(peers)]
-		peerCounter++
-		Ping(conn, outPeer, reply.Payload, int(reply.Seq), reply.ID)
-
-		thisUpdate := StatusUpdate{ReplyAt: time.Now(), Addr: reply.From.String(), Seq: reply.Seq, ID: reply.ID}
-		statusUpdates <- thisUpdate
-
 		currentHealth := <-health
-		for id, status := range currentHealth[reply.Seq] {
-			if status {
-				Ping(conn, reply.From.String(), reply.Payload, reply.Seq, id)
-			}
+		select {
+		case introduceHealth <- currentHealth:
+		default:
 		}
 
-		// start := reply.Seq * CHUNK_SIZE
-		// for i, dat := range reply.Payload {
-		// 	buffIdx := start + i
-		// 	recvBuffer[buffIdx] = dat
-		// }
+		if reply.ID >= NUM_REPEATS {
+			continue
+		}
+
+		outPeer := peers[peerCounter%len(peers)]
+		peerCounter++
+		outgoingRequests <- Request{To: outPeer, Seq: reply.Seq, ID: reply.ID, Payload: reply.Payload}
+
+		statusUpdates <- StatusUpdate{ReplyAt: time.Now(), Addr: reply.From.String(), Seq: reply.Seq, ID: reply.ID}
+
+		for id, status := range currentHealth[reply.Seq] {
+			if status {
+				outgoingRequests <- Request{To: reply.From.String(), Seq: reply.Seq, ID: id, Payload: reply.Payload}
+			}
+		}
 	}
 }

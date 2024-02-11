@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"fmt"
+	"net"
 	"net/netip"
 	"time"
 
@@ -74,6 +75,11 @@ func GeneratePublicIP() netip.Addr {
 	return addr
 }
 
+func NetipAddrToAddr(addr netip.Addr) net.Addr {
+	out, _ := net.ResolveIPAddr("ip4", addr.String())
+	return out
+}
+
 func FindPeers(numHosts int) []string {
 	hosts := make([]string, 0, numHosts)
 
@@ -93,9 +99,9 @@ func FindPeers(numHosts int) []string {
 	rand.Read(payload)
 
 	for len(hosts) < numHosts {
-		for i := 0; i < 100; i++ {
+		for i := 0; i < 200; i++ {
 			candidate := GeneratePublicIP()
-			Ping(conn, candidate.String(), payload, 0, 0)
+			Ping(conn, NetipAddrToAddr(candidate), payload, 0, 420)
 		}
 		sentAt := time.Now()
 
@@ -105,12 +111,12 @@ func FindPeers(numHosts int) []string {
 			case reply := <-replyChan:
 				receivedAt := time.Now()
 				latency := receivedAt.Sub(sentAt)
-				if latency > 200*time.Millisecond {
+				if latency > 350*time.Millisecond {
 					hosts = append(hosts, reply.From.String())
 					fmt.Print(".")
 				}
 
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(750 * time.Millisecond):
 				doneListening = true
 			}
 		}
