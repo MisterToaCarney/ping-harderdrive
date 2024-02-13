@@ -111,7 +111,7 @@ func FindPeers(numHosts int) []string {
 			case reply := <-replyChan:
 				receivedAt := time.Now()
 				latency := receivedAt.Sub(sentAt)
-				if latency > 350*time.Millisecond {
+				if latency > 250*time.Millisecond {
 					hosts = append(hosts, reply.From.String())
 					fmt.Print(".")
 				}
