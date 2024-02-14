@@ -8,11 +8,13 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/time/rate"
 )
 
 const CHUNK_SIZE = 1455
 const NUM_REPEATS = 3
-const NUM_CHUNKS = 40
+const NUM_CHUNKS = 10
+const PACKET_RATE_LIMIT = 2500
 
 type Reply struct {
 	From    net.Addr
@@ -90,6 +92,9 @@ func SendRequests(conn *icmp.PacketConn, requests chan Request, peers []string) 
 	parsedPeers := make([]*net.IPAddr, 0, len(peers))
 	peerCounter := 0
 
+	packetPeriod := time.Second / PACKET_RATE_LIMIT
+	limiter := rate.NewLimiter(rate.Every(packetPeriod), 16)
+
 	for _, unparsedPeer := range peers {
 		addr, err := net.ResolveIPAddr("ip4", unparsedPeer)
 		if err != nil {
@@ -102,6 +107,8 @@ func SendRequests(conn *icmp.PacketConn, requests chan Request, peers []string) 
 	for request := range requests {
 		addr := parsedPeers[peerCounter%len(parsedPeers)]
 		peerCounter++
+		r := limiter.Reserve()
+		time.Sleep(r.Delay())
 		Ping(conn, addr, request.Payload, request.Seq, request.ID)
 	}
 }
@@ -184,7 +191,7 @@ func Replenish(statusChan chan [][]time.Duration, requestChan chan Request) {
 		for seq, reps := range status {
 			shouldReplenish := true
 			for _, duration := range reps {
-				if duration < 1000*time.Millisecond {
+				if duration < 5000*time.Millisecond {
 					shouldReplenish = false
 				}
 			}
@@ -207,7 +214,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	peers := FindPeers(100)
+	peers := FindReliablePeers(400)
 
 	fmt.Println("Found peers")
 
@@ -243,7 +250,7 @@ func main() {
 
 		// Retransmit slow chunks
 		for id, duration := range currentHealth[reply.Seq] {
-			if duration > 250*time.Millisecond && time.Since(lastRetransmits[reply.Seq][reply.ID]) > 100*time.Millisecond {
+			if duration > 400*time.Millisecond && time.Since(lastRetransmits[reply.Seq][reply.ID]) > 400*time.Millisecond {
 				outgoingRequests <- Request{Seq: reply.Seq, ID: id, Payload: reply.Payload}
 				lastRetransmits[reply.Seq][reply.ID] = time.Now()
 			}

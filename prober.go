@@ -1,14 +1,39 @@
 package main
 
 import (
+	"cmp"
 	"crypto/rand"
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"golang.org/x/net/icmp"
+	"golang.org/x/time/rate"
 )
+
+type PeerStats struct {
+	Peer              string
+	SentPackets       int
+	ReceivedPackets   int
+	PacketSuccessRate float32
+}
+
+func (stat *PeerStats) IncrementSentPackets() {
+	stat.SentPackets++
+	stat.CalculateSuccessRate()
+}
+
+func (stat *PeerStats) IncrementReceivedPackets() {
+	stat.ReceivedPackets++
+	stat.CalculateSuccessRate()
+}
+
+func (stat *PeerStats) CalculateSuccessRate() float32 {
+	stat.PacketSuccessRate = float32(stat.ReceivedPackets) / float32(stat.SentPackets)
+	return stat.PacketSuccessRate
+}
 
 var networks = []string{
 	"0.0.0.0/8",
@@ -116,7 +141,7 @@ func FindPeers(numHosts int) []string {
 					fmt.Print(".")
 				}
 
-			case <-time.After(750 * time.Millisecond):
+			case <-time.After(500 * time.Millisecond):
 				doneListening = true
 			}
 		}
@@ -124,5 +149,103 @@ func FindPeers(numHosts int) []string {
 
 	fmt.Println()
 	return hosts[:numHosts]
+}
 
+func MonitorPeers(peers []string, requestChan chan string, replyChan chan Reply, resultsRequest chan bool, resultsChan chan []PeerStats) {
+	peerStatsMap := make(map[string]*PeerStats)
+	peerStatsSlice := make([]*PeerStats, 0, len(peers))
+
+	for _, peer := range peers {
+		peerStats := &PeerStats{Peer: peer, SentPackets: 0, ReceivedPackets: 0, PacketSuccessRate: 0}
+		peerStatsMap[peer] = peerStats
+		peerStatsSlice = append(peerStatsSlice, peerStats)
+	}
+
+	for {
+		select {
+		case request := <-requestChan:
+			if peerStatsMap[request] != nil {
+				peerStatsMap[request].IncrementSentPackets()
+			}
+		case reply := <-replyChan:
+			if peerStatsMap[reply.From.String()] != nil {
+				peerStatsMap[reply.From.String()].IncrementReceivedPackets()
+			}
+		case <-resultsRequest:
+			slices.SortFunc(peerStatsSlice, func(a, b *PeerStats) int {
+				return cmp.Compare(a.PacketSuccessRate, b.PacketSuccessRate)
+			})
+			out := make([]PeerStats, 0, len(peerStatsSlice))
+			for _, peerStats := range peerStatsSlice {
+				out = append(out, *peerStats)
+			}
+			resultsChan <- out
+			return
+		}
+	}
+}
+
+func TestPeers(peers []string) []string {
+	fmt.Println("Testing Peers")
+	packetPeriod := time.Second / 1000
+	parsedPeers := make([]net.Addr, 0, len(peers))
+	for _, peer := range peers {
+		addr, err := net.ResolveIPAddr("ip4", peer)
+		if err != nil {
+			continue
+		}
+		parsedPeers = append(parsedPeers, addr)
+	}
+
+	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	replyChan := make(chan Reply, 4096)
+	requestChan := make(chan string, 4096)
+	resultsRequestChan := make(chan bool)
+	peerStatsChan := make(chan []PeerStats)
+	go GetReplies(conn, replyChan)
+	go MonitorPeers(peers, requestChan, replyChan, resultsRequestChan, peerStatsChan)
+
+	payload := make([]byte, 1450)
+
+	limiter := rate.NewLimiter(rate.Every(packetPeriod), 50)
+
+	for seq := 0; seq < 50; seq++ {
+		fmt.Print(".")
+		for _, peer := range parsedPeers {
+			r := limiter.Reserve()
+			time.Sleep(r.Delay())
+			Ping(conn, peer, payload, seq, 0)
+			requestChan <- peer.String()
+		}
+	}
+
+	time.Sleep(time.Second)
+
+	resultsRequestChan <- true
+	stats := <-peerStatsChan
+
+	fmt.Println()
+
+	goodPeers := make([]string, 0)
+
+	for _, stat := range stats {
+		if stat.PacketSuccessRate >= 0.98 {
+			goodPeers = append(goodPeers, stat.Peer)
+		}
+	}
+
+	fmt.Println("Found", len(goodPeers), "good peers out of", len(parsedPeers), "peers.")
+	time.Sleep(time.Second)
+	return goodPeers
+}
+
+func FindReliablePeers(count int) []string {
+	peers := FindPeers(count)
+	goodPeers := TestPeers(peers)
+	return goodPeers
 }
