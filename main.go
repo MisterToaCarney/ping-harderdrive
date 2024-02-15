@@ -13,9 +13,9 @@ import (
 
 const CHUNK_SIZE = 1455
 const NUM_REPEATS = 3
-const NUM_CHUNKS = 70
-const PACKET_RATE_LIMIT = 2500
-const NUM_PEERS = 300
+const NUM_CHUNKS = 140
+const PACKET_RATE_LIMIT = 6000
+const NUM_PEERS = 500
 
 type Reply struct {
 	From    net.Addr
@@ -138,6 +138,27 @@ func PrintStatus(status [][]time.Duration) {
 	}
 }
 
+func PrintStatusShort(status [][]time.Duration) {
+	slowCount := 0
+	failCount := 0
+	for _, reps := range status {
+		for _, duration := range reps {
+			if duration > 1000*time.Millisecond {
+				failCount++
+			} else if duration > 500*time.Millisecond {
+				slowCount++
+			}
+		}
+	}
+	for i := 0; i < failCount; i++ {
+		fmt.Print("X")
+	}
+	for i := 0; i < slowCount; i++ {
+		fmt.Print("O")
+	}
+	fmt.Println()
+}
+
 func Monitor(replyUpdates chan ReplyUpdate, statusChan chan [][]time.Duration) {
 	lastReplies := make([][]time.Time, NUM_CHUNKS)
 	for i := 0; i < NUM_CHUNKS; i++ {
@@ -166,7 +187,7 @@ func Monitor(replyUpdates chan ReplyUpdate, statusChan chan [][]time.Duration) {
 		}
 
 		if time.Since(lastPrint) > 250*time.Millisecond {
-			PrintStatus(out)
+			PrintStatusShort(out)
 			lastPrint = time.Now()
 		}
 
@@ -308,7 +329,7 @@ func main() {
 
 		// Retransmit slow chunks
 		for id, duration := range currentHealth[reply.Seq] {
-			if duration > 800*time.Millisecond && time.Since(lastRetransmits[reply.Seq][reply.ID]) > 800*time.Millisecond {
+			if duration > 300*time.Millisecond && time.Since(lastRetransmits[reply.Seq][reply.ID]) > 300*time.Millisecond {
 				outgoingRequests <- Request{Seq: reply.Seq, ID: id, Payload: reply.Payload}
 				lastRetransmits[reply.Seq][reply.ID] = time.Now()
 			}
