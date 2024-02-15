@@ -13,8 +13,9 @@ import (
 
 const CHUNK_SIZE = 1455
 const NUM_REPEATS = 3
-const NUM_CHUNKS = 10
+const NUM_CHUNKS = 70
 const PACKET_RATE_LIMIT = 2500
+const NUM_PEERS = 300
 
 type Reply struct {
 	From    net.Addr
@@ -113,14 +114,6 @@ func SendRequests(conn *icmp.PacketConn, requests chan Request, peers []string) 
 	}
 }
 
-// func ReadFile(filename string) []byte {
-// 	dat, err := os.ReadFile(filename)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	return dat
-// }
-
 func PrintStatus(status [][]time.Duration) {
 	fmt.Println()
 	for seq, reps := range status {
@@ -172,7 +165,7 @@ func Monitor(replyUpdates chan ReplyUpdate, statusChan chan [][]time.Duration) {
 			}
 		}
 
-		if time.Since(lastPrint) > 100*time.Millisecond {
+		if time.Since(lastPrint) > 250*time.Millisecond {
 			PrintStatus(out)
 			lastPrint = time.Now()
 		}
@@ -196,14 +189,60 @@ func Replenish(statusChan chan [][]time.Duration, requestChan chan Request) {
 				}
 			}
 			if shouldReplenish {
+				payload := make([]byte, CHUNK_SIZE)
 				fmt.Println("Replenishing", seq)
 				for i := 0; i < NUM_REPEATS; i++ {
-					requestChan <- Request{Seq: seq, ID: i, Payload: make([]byte, CHUNK_SIZE)}
+					requestChan <- Request{Seq: seq, ID: i, Payload: payload}
 				}
 
 			}
 		}
 		lastReplenish = time.Now()
+	}
+}
+
+func Replace(writeRequestChan chan WriteRequest, replaceQuery chan Reply, replaceResponse chan []byte, syncChan chan bool) {
+	deadlinesBySeq := make(map[int]time.Time)
+	writeRequestsBySeq := make(map[int]WriteRequest)
+
+	for {
+		// Delete expired write requests
+		for seq, deadline := range deadlinesBySeq {
+			if time.Since(deadline) > 0 {
+				delete(deadlinesBySeq, seq)
+				delete(writeRequestsBySeq, seq)
+			}
+		}
+
+		// Notify block device that we are synced, i.e no pending write requests
+		if len(writeRequestsBySeq) == 0 {
+			select {
+			case syncChan <- true:
+			default:
+			}
+		}
+
+		select {
+		case writeRequest := <-writeRequestChan:
+			writeRequestsBySeq[writeRequest.Seq] = writeRequest
+			deadlinesBySeq[writeRequest.Seq] = time.Now().Add(1 * time.Second)
+
+		case replyQuery := <-replaceQuery:
+			deadline, deadlineOk := deadlinesBySeq[replyQuery.Seq]
+			writeRequest, writeRequestOk := writeRequestsBySeq[replyQuery.Seq]
+			if !deadlineOk || !writeRequestOk {
+				replaceResponse <- replyQuery.Payload
+				continue
+			}
+			if time.Since(deadline) > 0 {
+				replaceResponse <- replyQuery.Payload
+				continue
+			}
+			newPayload := make([]byte, len(replyQuery.Payload))
+			copy(newPayload, replyQuery.Payload)
+			copy(newPayload[writeRequest.ExtentStart:writeRequest.ExtentEnd], writeRequest.Payload)
+			replaceResponse <- newPayload
+		}
 	}
 }
 
@@ -214,7 +253,7 @@ func main() {
 	}
 	defer conn.Close()
 
-	peers := FindReliablePeers(400)
+	peers := FindReliablePeers(NUM_PEERS)
 
 	fmt.Println("Found peers")
 
@@ -223,11 +262,22 @@ func main() {
 	replyUpdates := make(chan ReplyUpdate, 4096)
 	health := make(chan [][]time.Duration)
 	replenishHealthChan := make(chan [][]time.Duration)
+	nbdReplyChan := make(chan Reply)
+	nbdWriteRequestChan := make(chan WriteRequest)
+	nbdReplaceQueryChan := make(chan Reply)
+	nbdReplaceResponseChan := make(chan []byte)
+	nbdSyncChan := make(chan bool)
+	nbdReadyChan := make(chan bool)
 
 	go GetReplies(conn, incomingReplies)
 	go SendRequests(conn, outgoingRequests, peers)
 	go Monitor(replyUpdates, health)
 	go Replenish(replenishHealthChan, outgoingRequests)
+	go Replace(nbdWriteRequestChan, nbdReplaceQueryChan, nbdReplaceResponseChan, nbdSyncChan)
+	go ExposeBackend(nbdReplyChan, nbdWriteRequestChan, nbdSyncChan, nbdReadyChan)
+
+	<-nbdReadyChan
+	go ConnectNBD()
 
 	currentHealth := <-health
 	replenishHealthChan <- currentHealth
@@ -245,12 +295,20 @@ func main() {
 		currentHealth = <-health
 		replenishHealthChan <- currentHealth
 
-		outgoingRequests <- Request{Seq: reply.Seq, ID: reply.ID, Payload: reply.Payload}
+		select {
+		case nbdReplyChan <- reply:
+		default:
+		}
+
+		nbdReplaceQueryChan <- reply
+		payload := <-nbdReplaceResponseChan
+
+		outgoingRequests <- Request{Seq: reply.Seq, ID: reply.ID, Payload: payload}
 		replyUpdates <- ReplyUpdate{ReplyAt: time.Now(), Addr: reply.From.String(), Seq: reply.Seq, ID: reply.ID}
 
 		// Retransmit slow chunks
 		for id, duration := range currentHealth[reply.Seq] {
-			if duration > 400*time.Millisecond && time.Since(lastRetransmits[reply.Seq][reply.ID]) > 400*time.Millisecond {
+			if duration > 800*time.Millisecond && time.Since(lastRetransmits[reply.Seq][reply.ID]) > 800*time.Millisecond {
 				outgoingRequests <- Request{Seq: reply.Seq, ID: id, Payload: reply.Payload}
 				lastRetransmits[reply.Seq][reply.ID] = time.Now()
 			}
