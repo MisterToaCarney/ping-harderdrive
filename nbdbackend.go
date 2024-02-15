@@ -150,6 +150,8 @@ func (b *PingBackend) WriteAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 
+	b.Sync()
+
 	return len(p), nil
 }
 

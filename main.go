@@ -13,9 +13,9 @@ import (
 
 const CHUNK_SIZE = 1455
 const NUM_REPEATS = 3
-const NUM_CHUNKS = 140
+const NUM_CHUNKS = 100
 const PACKET_RATE_LIMIT = 6000
-const NUM_PEERS = 500
+const NUM_PEERS = 300
 
 type Reply struct {
 	From    net.Addr
@@ -139,6 +139,7 @@ func PrintStatus(status [][]time.Duration) {
 }
 
 func PrintStatusShort(status [][]time.Duration) {
+	// return
 	slowCount := 0
 	failCount := 0
 	for _, reps := range status {
